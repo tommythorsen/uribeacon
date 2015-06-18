@@ -47,6 +47,7 @@ public class MotionManager implements SensorEventListener {
   private MotionListener mMotionListener;
 
   private long mStopTimestamp = Long.MAX_VALUE;
+  private double mPreviousVector = Double.NaN;
 
   public MotionManager(Context context) {
     Log.i(TAG, "MotionManager Created");
@@ -96,19 +97,36 @@ public class MotionManager implements SensorEventListener {
     float accY = event.values[1];
     float accZ = event.values[2];
     double vector = Math.pow(accX, 2) + Math.pow(accY, 2) + Math.pow(accZ, 2);
-    // Measure if acceleration changes by +/- 0.4g where g ~= 9.8 m/s^2
-    // Low acc(-0.4) = 9.4 and (9.4)^2 ~= 88.36
-    // High acc(+0.4) = 10.2 and (10.2)^2 ~= 104.04
-    if ((vector < 88) || (vector > 104)) {
+
+    if (Double.isNaN(mPreviousVector)) {
+      mPreviousVector = vector;
+      return;
+    }
+
+    // In a perfect world, where all accelerometers were calibrated well, we
+    // could just compare the current acceleration value with 9.8^2 (gravity),
+    // but some phones report really wrong values even when they're lying
+    // perfectly still. To account for bad calibration, we do not compare with
+    // the gravity value, but rather with the value we got in the previous call
+    // to handleAccelChange. If the acceleration value changes by +/- 0.4g,
+    // where g ~= 9.8 m/s^2, we trigger a motion event.
+    //
+    //   Regular acc: 9.8^2 ~= 96
+    //   High acc (+0.4g): (9.8 + 0.4*9.8)^2 ~= 188
+    //   Difference ~= 92
+    //
+    if (Math.abs(vector - mPreviousVector) > 92.0) {
       // Leave Motion flagged for 10 seconds before timeout
       // Only send event if state transition to MOTION
       if (mStopTimestamp == Long.MAX_VALUE) {
         mMotionListener.onMotion();
       }
       mStopTimestamp = event.timestamp + IDLE_TIME_NANO;
+      mPreviousVector = vector;
     } else if (event.timestamp > mStopTimestamp) {
       // Only send event if state transition to MOTION_TIMEOUT
       mStopTimestamp = Long.MAX_VALUE;
+      mPreviousVector = Double.NaN;
       mMotionListener.onMotionTimeout();
     }
   }
