@@ -22,6 +22,10 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.TriggerEvent;
+import android.hardware.TriggerEventListener;
+import android.os.Build;
+import android.os.Handler;
 import android.util.Log;
 
 import java.util.concurrent.TimeUnit;
@@ -30,9 +34,9 @@ import java.util.concurrent.TimeUnit;
  * Class MotionManager - an interface to the Android ACC sensor X Y Z, which 
  * provides a Significant Motion Detection and Timeout interface
  */
-public class MotionManager implements SensorEventListener {
+public class MotionManager extends TriggerEventListener implements SensorEventListener {
   private static final String TAG = MotionManager.class.getSimpleName();
-  static final long IDLE_TIME_NANO = TimeUnit.SECONDS.toNanos(10);
+  static final long IDLE_TIME = TimeUnit.SECONDS.toMillis(10);
 
   /** 
    * Interface for Motion Listener.
@@ -42,18 +46,40 @@ public class MotionManager implements SensorEventListener {
     void onMotionTimeout();
   }
 
-  private final SensorManager mSensorManager;
-  private final Sensor mAccelerometer;
-  private MotionListener mMotionListener;
+  private class Timeout implements Runnable {
+    public void run() {
+      if (mMotionListener != null) {
+        mMotionListener.onMotionTimeout();
+      }
+      mPreviousVector = Double.NaN;
+      mTimeout = null;
+    }
+  }
 
-  private long mStopTimestamp = Long.MAX_VALUE;
-  private double mPreviousVector = Double.NaN;
+  private final SensorManager mSensorManager;
+  private Sensor mSensor = null;
+  private MotionListener mMotionListener;
+  private final Handler mHandler;
+  private Timeout mTimeout = null;
+  private double mPreviousVector;
 
   public MotionManager(Context context) {
     Log.i(TAG, "MotionManager Created");
     mSensorManager =
         (SensorManager) context.getApplicationContext().getSystemService(Activity.SENSOR_SERVICE);
-    mAccelerometer = mSensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+
+    mHandler = new Handler();
+
+    // First try to create a significant motion sensor
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+      mSensor = mSensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION);
+    }
+
+    // If we were not able to create a significant motion sensor,
+    // create an accelerometer sensor instead
+    if (mSensor == null) {
+      mSensor = mSensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+    }
   }
 
   public void register(MotionListener ml) {
@@ -61,18 +87,53 @@ public class MotionManager implements SensorEventListener {
       return;
     }
     mMotionListener = ml;
-    mStopTimestamp = Long.MAX_VALUE;
-    // Note to change effective sample rate, chose another SensorManger parameter
-    mSensorManager.registerListener(this, mAccelerometer, SensorManager.SENSOR_DELAY_NORMAL);
+    mPreviousVector = Double.NaN;
+
+    if (mSensor.getType() == Sensor.TYPE_SIGNIFICANT_MOTION) {
+      mSensorManager.requestTriggerSensor(this, mSensor);
+    } else if (mSensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+      // Note to change effective sample rate, chose another SensorManger parameter
+      mSensorManager.registerListener(this, mSensor, SensorManager.SENSOR_DELAY_NORMAL);
+    }
     Log.i(TAG, "ACC Motion Provider Listener Registered");
   }
 
   public void unregister() {
+    stopTimeout();
     mSensorManager.unregisterListener(this);
     Log.i(TAG, "ACC Motion Provider Listener Unregistered");
     mMotionListener = null;
   }
 
+  public void startTimeout() {
+    if (mTimeout != null) {
+      mHandler.removeCallbacks(mTimeout);
+    }
+    mTimeout = new Timeout();
+    mHandler.postDelayed(mTimeout, IDLE_TIME);
+  }
+
+  public void stopTimeout() {
+    if (mTimeout != null) {
+      mHandler.removeCallbacks(mTimeout);
+      mTimeout = null;
+    }
+  }
+
+  public void onTrigger(TriggerEvent event) {
+    if (mMotionListener != null) {
+      // Only send event if state transition to MOTION
+      if (mTimeout == null) {
+        mMotionListener.onMotion();
+      }
+
+      // Leave Motion flagged for 10 seconds before timeout
+      startTimeout();
+
+      // Request another significant motion event
+      mSensorManager.requestTriggerSensor(this, mSensor);
+    }
+  }
 
   @Override
   public void onAccuracyChanged(Sensor sensor, int accuracy) {}
@@ -98,11 +159,6 @@ public class MotionManager implements SensorEventListener {
     float accZ = event.values[2];
     double vector = Math.pow(accX, 2) + Math.pow(accY, 2) + Math.pow(accZ, 2);
 
-    if (Double.isNaN(mPreviousVector)) {
-      mPreviousVector = vector;
-      return;
-    }
-
     // In a perfect world, where all accelerometers were calibrated well, we
     // could just compare the current acceleration value with 9.8^2 (gravity),
     // but some phones report really wrong values even when they're lying
@@ -115,19 +171,18 @@ public class MotionManager implements SensorEventListener {
     //   High acc (+0.4g): (9.8 + 0.4*9.8)^2 ~= 188
     //   Difference ~= 92
     //
-    if (Math.abs(vector - mPreviousVector) > 92.0) {
-      // Leave Motion flagged for 10 seconds before timeout
+    if (!Double.isNaN(mPreviousVector) &&
+        Math.abs(vector - mPreviousVector) > 92.0)
+    {
       // Only send event if state transition to MOTION
-      if (mStopTimestamp == Long.MAX_VALUE) {
+      if (mTimeout == null) {
         mMotionListener.onMotion();
       }
-      mStopTimestamp = event.timestamp + IDLE_TIME_NANO;
-      mPreviousVector = vector;
-    } else if (event.timestamp > mStopTimestamp) {
-      // Only send event if state transition to MOTION_TIMEOUT
-      mStopTimestamp = Long.MAX_VALUE;
-      mPreviousVector = Double.NaN;
-      mMotionListener.onMotionTimeout();
+
+      // Leave Motion flagged for 10 seconds before timeout
+      startTimeout();
     }
+
+    mPreviousVector = vector;
   }
 }
