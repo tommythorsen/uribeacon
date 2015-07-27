@@ -39,7 +39,6 @@ import android.support.annotation.Nullable;
 public class BluetoothLeScannerCompatProvider {
 
   private static BluetoothLeScannerCompat scannerInstance;
-  private static boolean allowHardware = true;
 
   private BluetoothLeScannerCompatProvider() {
   }

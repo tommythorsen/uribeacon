@@ -43,7 +43,7 @@ function get_mac(bytes) {
 function get_uri(bytes) {
   uri = ""
   limit = service_data_limit(bytes)
-  for (i = 28; i < limit; i++) {
+  for (i = 28; i <= limit; i++) {
     code = strtonum("0x"bytes[i])
     if (code in Codes) {
        uri = uri Codes[code]
