@@ -23,6 +23,7 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Build;
 
 import org.uribeacon.scan.util.Clock;
 import org.uribeacon.scan.util.Logger;
@@ -32,9 +33,11 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -96,6 +99,9 @@ class JbBluetoothLeScannerCompat extends BluetoothLeScannerCompat {
   private final AlarmManager alarmManager;
   private final PendingIntent alarmIntent;
   private long alarmIntervalMillis;
+
+  // Variable to hold a scheduled task. Only used in Android 5.1.
+  ScheduledFuture scheduledTask;
 
   // Map of BD_ADDR->ScanResult for replay to new registrations.
   // Entries are evicted after SCAN_LOST_CYCLES cycles.
@@ -416,6 +422,7 @@ class JbBluetoothLeScannerCompat extends BluetoothLeScannerCompat {
    * no clients, or a batch scan running, it will cancel the alarm.
    */
   private void updateRepeatingAlarm() {
+      Logger.logDebug("updateRepeatingAlarm, getMaxPriorityScanMode = " + getMaxPriorityScanMode());
     // Apply Scan Mode (Cycle Parameters)
     setScanMode(getMaxPriorityScanMode());
 
@@ -429,12 +436,39 @@ class JbBluetoothLeScannerCompat extends BluetoothLeScannerCompat {
       int scanPeriod = idleMillis + getScanActiveMillis();
       if ((idleMillis != 0) && (alarmIntervalMillis != scanPeriod)) {
         alarmIntervalMillis = scanPeriod;
-        // Specifies a repeating alarm at the scanPeriod, starting immediately.
-        alarmManager.setRepeating(AlarmManager.RTC_WAKEUP,
-            0, alarmIntervalMillis,
-            alarmIntent);
-        Logger.logInfo("Scan alarm setup complete @ " + System.currentTimeMillis());
+
+        Logger.logDebug("Setting repeating alarm with interval: " + alarmIntervalMillis);
+
+        // In Android 5.1 the shortest interval for repeating alarm is 60 seconds:
+        // http://code.google.com/p/android/issues/detail?id=161244
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.LOLLIPOP && alarmIntervalMillis < 60000) {
+          Logger.logDebug("Using LOLLIPOP_MR1 workaround.");
+          alarmManager.cancel(alarmIntent);
+          cancelScheduledTask();
+          scheduledTask = Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay(new Runnable() {
+              @Override
+              public void run() {
+                blockingScanCycle();
+              }
+            },
+            0, // initial delay
+            alarmIntervalMillis,
+            TimeUnit.MILLISECONDS);
+        } else {
+          cancelScheduledTask();
+          // Specifies a repeating alarm at the scanPeriod, starting immediately.
+          alarmManager.setRepeating(AlarmManager.RTC_WAKEUP,
+              0, alarmIntervalMillis,
+              alarmIntent);
+          Logger.logInfo("Scan alarm setup complete @ " + System.currentTimeMillis());
+        }
       }
+    }
+  }
+
+  private void cancelScheduledTask() {
+    if (scheduledTask != null) {
+      scheduledTask.cancel(false);
     }
   }
 
