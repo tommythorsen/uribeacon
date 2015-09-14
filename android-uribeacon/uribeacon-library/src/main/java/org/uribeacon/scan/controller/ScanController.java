@@ -26,12 +26,14 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.os.Handler;
 import android.os.PowerManager;
 import android.util.Log;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Class ScanController processes events and makes FSM transitions to decide on the lowest power
@@ -54,15 +56,6 @@ public class ScanController implements MotionManager.MotionListener {
   private enum Event {
     SCREEN_ON, SCREEN_OFF, MOTION, MOTION_TIMEOUT;
   }
-
-  /**
-   * Modifies the behavior of the controller.
-   */
-  public enum ScreenOffMode {
-    NO_SCAN, SLOW_SCAN
-  }
-
-  private Map<ScanState, Map<Event, ScanState>> mScanStateTable;
 
   private class ControllerScanSettings {
     public ScanSettings mSettings;
@@ -94,9 +87,23 @@ public class ScanController implements MotionManager.MotionListener {
   // System ScanState
   private final Context mContext;
   private final MotionManager mMotionManager;
+  private final PowerManager mPowerManager;
 
   // Scan ScanState Variable (default value is the first state)
   private ScanState mScanState = ScanState.FAST_SCAN;
+
+  private class Timeout implements Runnable {
+    public void run() {
+      Log.d(TAG, "IDLE TIMEOUT");
+      mIdleTimeout = null;
+      updateState();
+    }
+  }
+
+  private Timeout mIdleTimeout = null;
+  private final Handler mHandler = new Handler();
+
+  private boolean mInMotion = false;
 
   // Listen for broadcast events that will effect the scan state
   private final BroadcastReceiver mScanEventListener = new BroadcastReceiver() {
@@ -105,26 +112,38 @@ public class ScanController implements MotionManager.MotionListener {
       Log.d(TAG, "DEBUG onReceive");
       String action = intent.getAction();
       if (action.equals(Intent.ACTION_SCREEN_ON)) {
-        stateEvent(Event.SCREEN_ON);
+        updateState();
       } else if (action.equals(Intent.ACTION_SCREEN_OFF)) {
-        stateEvent(Event.SCREEN_OFF);
+        startIdleTimeout();
+        updateState();
       } else {
         Log.d(TAG, "Undefined Event: Intent Action=" + action);
       }
     }
   };
 
-  public ScanController(Context context, ScreenOffMode scanMode) {
-    mContext = context;
-    mMotionManager = new MotionManager(mContext);
-    init(scanMode);
+  public ScanController(Context context) {
+    this(context, new MotionManager(context));
   }
 
-  public ScanController(Context context, MotionManager motionManager,
-      ScreenOffMode scanMode) {
+  public ScanController(Context context, MotionManager motionManager) {
     mContext = context;
+
+    mPowerManager = (PowerManager)mContext.getSystemService(Context.POWER_SERVICE);
     mMotionManager = motionManager;
-    init(scanMode);
+    mMotionManager.register(this);
+
+    mScanState = ScanState.NO_SCAN;
+
+    mDeviceCallbacks = new HashMap<ScanSettings, ControllerScanSettings>();
+    mLeScanner = BluetoothLeScannerCompatProvider.getBluetoothLeScannerCompat(mContext);
+
+    IntentFilter intentFilter = new IntentFilter();
+    intentFilter.addAction(Intent.ACTION_SCREEN_ON);
+    intentFilter.addAction(Intent.ACTION_SCREEN_OFF);
+    mContext.registerReceiver(mScanEventListener, intentFilter);
+
+    updateState();
   }
 
   public boolean startScan(ScanSettings settings, List<ScanFilter> filters,
@@ -170,30 +189,14 @@ public class ScanController implements MotionManager.MotionListener {
     return mDeviceCallbacks.size();
   }
 
-  private void setState(ScanState toState) {
-    if (toState == ScanState.NO_SCAN) {
-      mMotionManager.unregister();
-    } else if (mScanState == ScanState.NO_SCAN) {
-      mMotionManager.register(this);
-    }
-
-    updateState(toState);
-  }
-
-  private void stateEvent(Event event) {
-    if (!mScanStateTable.get(mScanState).containsKey(event)) {
-      return;
-    }
-    Log.d(TAG, "STATE EVENT " + event.toString());
-    setState(mScanStateTable.get(mScanState).get(event));
-  }
-
   /**
    * Callback for significant motion event
    */
   @Override
   public void onMotion() {
-    stateEvent(Event.MOTION);
+    Log.d(TAG, "onMotion()");
+    mInMotion = true;
+    updateState();
   }
 
   /**
@@ -201,19 +204,47 @@ public class ScanController implements MotionManager.MotionListener {
    */
   @Override
   public void onMotionTimeout() {
-    stateEvent(Event.MOTION_TIMEOUT);
+    Log.d(TAG, "onMotionTimeout()");
+    mInMotion = false;
+    startIdleTimeout();
+    updateState();
   }
 
-  private void updateState(ScanState state) {
-    if (state == mScanState) {
-      return;
+  private void startIdleTimeout() {
+    Log.d(TAG, "startIdleTimeout()");
+    if (mIdleTimeout != null) {
+      mHandler.removeCallbacks(mIdleTimeout);
     }
-    mScanState = state;
+    mIdleTimeout = new Timeout();
+    mHandler.postDelayed(mIdleTimeout, TimeUnit.MINUTES.toMillis(20));
+  }
+
+  private void updateState() {
+    Log.d(TAG, "updateState()");
+    Log.d(TAG, "    motion = " + mInMotion);
+    Log.d(TAG, "    screen = " + mPowerManager.isScreenOn());
+    Log.d(TAG, "   timeout = " + (mIdleTimeout != null));
+    final ScanState newState;
+    if (mInMotion || mPowerManager.isScreenOn()) {
+      newState = ScanState.FAST_SCAN;
+    } else if (mIdleTimeout != null) {
+      newState = ScanState.SLOW_SCAN;
+    } else {
+      newState = ScanState.NO_SCAN;
+    }
+
+    if (newState == mScanState) {
+        Log.d(TAG, "STATE NOT CHANGED");
+        return;
+    }
+
+    mScanState = newState;
+
     Log.d(TAG, "NEW STATE=" + mScanState.toString());
     for (Map.Entry<ScanSettings, ControllerScanSettings> entry : mDeviceCallbacks.entrySet()) {
       ControllerScanSettings scanSettings = entry.getValue();
       mLeScanner.stopScan(scanSettings.mCallback);
-      if (state != ScanState.NO_SCAN) {
+      if (mScanState != ScanState.NO_SCAN) {
         int mode = getModeFromScanState(mScanState);
         ScanSettings settings = scanSettings.setScanMode(mode);
         mLeScanner.startScan(scanSettings.mFilters, settings, scanSettings.mCallback);
@@ -224,82 +255,6 @@ public class ScanController implements MotionManager.MotionListener {
   private int getModeFromScanState(ScanState state) {
     return (state == ScanState.SLOW_SCAN) ? ScanSettings.SCAN_MODE_LOW_POWER
         : ScanSettings.SCAN_MODE_LOW_LATENCY;
-  }
-
-  /**
-   * Register broadcast listener with all Intent filters we need
-   */
-  public void init(ScreenOffMode scanMode) {
-    mScanState = ScanState.NO_SCAN;
-
-    if (scanMode == ScreenOffMode.NO_SCAN) {
-      /*
-       * NO_SCAN
-       *    SCREEN_ON -> FAST_SCAN
-       * SLOW_SCAN
-       *    MOTION  ->  FAST_SCAN
-       *    SCREEN_OFF -> NO_SCAN
-       * FAST_SCAN
-       *    MOTION_TIMEOUT -> SLOW_SCAN
-       *    SCREEN_OFF -> NO_SCAN
-       */
-      mScanStateTable = new HashMap<ScanState, Map<Event, ScanState>>() {{
-        put(ScanState.NO_SCAN, new HashMap<Event, ScanState>() {{
-          put(Event.SCREEN_ON, ScanState.FAST_SCAN);
-        }});
-
-        put(ScanState.SLOW_SCAN, new HashMap<Event, ScanState>() {{
-          put(Event.MOTION, ScanState.FAST_SCAN);
-          put(Event.SCREEN_OFF, ScanState.NO_SCAN);
-        }});
-
-        put(ScanState.FAST_SCAN, new HashMap<Event, ScanState>() {{
-          put(Event.MOTION_TIMEOUT, ScanState.SLOW_SCAN);
-          put(Event.SCREEN_OFF, ScanState.NO_SCAN);
-        }});
-      }};
-    } else if (scanMode == ScreenOffMode.SLOW_SCAN) {
-      /*
-       * NO_SCAN
-       *    SCREEN_ON -> FAST_SCAN
-       * SLOW_SCAN
-       *    MOTION  ->  FAST_SCAN
-       *    SCREEN_ON -> FAST_SCAN
-       * FAST_SCAN
-       *    MOTION_TIMEOUT -> SLOW_SCAN
-       *    SCREEN_OFF -> SLOW_SCAN
-       */
-      mScanStateTable = new HashMap<ScanState, Map<Event, ScanState>>() {{
-        put(ScanState.NO_SCAN, new HashMap<Event, ScanState>() {{
-          put(Event.SCREEN_ON, ScanState.FAST_SCAN);
-        }});
-
-        put(ScanState.SLOW_SCAN, new HashMap<Event, ScanState>() {{
-          put(Event.MOTION, ScanState.FAST_SCAN);
-          put(Event.SCREEN_ON, ScanState.FAST_SCAN);
-        }});
-
-        put(ScanState.FAST_SCAN, new HashMap<Event, ScanState>() {{
-          put(Event.MOTION_TIMEOUT, ScanState.SLOW_SCAN);
-          put(Event.SCREEN_OFF, ScanState.SLOW_SCAN);
-        }});
-      }};
-    }
-
-    mDeviceCallbacks = new HashMap<ScanSettings, ControllerScanSettings>();
-    mLeScanner = BluetoothLeScannerCompatProvider.getBluetoothLeScannerCompat(mContext);
-
-    IntentFilter intentFilter = new IntentFilter();
-    intentFilter.addAction(Intent.ACTION_SCREEN_ON);
-    intentFilter.addAction(Intent.ACTION_SCREEN_OFF);
-    mContext.registerReceiver(mScanEventListener, intentFilter);
-
-    // Only register the MotionProvider if the screen is already on
-    PowerManager powerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
-
-    if (powerManager.isScreenOn()) {
-      setState(ScanState.FAST_SCAN);
-    }
   }
 
   /**
